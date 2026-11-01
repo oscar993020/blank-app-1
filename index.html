@@ -1,0 +1,153 @@
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import talib
+import xgboost as xgb
+import yfinance as yf
+
+# 設定網頁版面與標題
+st.set_page_config(
+    page_title="AI 量化交易與 K 線預測平台", page_icon="📈", layout="wide"
+)
+
+st.title("📈 AI 量化交易與 K 線圖型態預測平台")
+st.markdown(
+    "結合 **TA-Lib 技術指標**、**K 線型態辨識** 與 **XGBoost 機器學習模型**"
+    " 的即時分析工具。"
+)
+
+# --- 側邊欄控制項 ---
+st.sidebar.header("⚙️ 模型與數據設定")
+ticker = st.sidebar.text_input(
+    "輸入股票代號 (例如美股 NVDA, 港股 0700.HK, VOO)", value="NVDA"
+)
+start_date = st.sidebar.date_input(
+    "回測起始日期", value=pd.to_datetime("2024-01-01")
+)
+forward_days = st.sidebar.slider("預測未來天數 (預測目標)", 1, 5, 3)
+threshold = (
+    st.sidebar.slider("上漲目標閾值 (%)", 1.0, 5.0, 2.0) / 100.0
+)
+
+
+# --- 載入資料與特徵工程 ---
+@st.cache_data
+def load_and_process_data(symbol, start):
+  data = yf.download(symbol, start=start)
+  if isinstance(data.columns, pd.MultiIndex):
+    data.columns = data.columns.get_level_values(0)
+
+  op, hi, lo, cl, vol = (
+      data["Open"],
+      data["High"],
+      data["Low"],
+      data["Close"],
+      data["Volume"],
+  )
+
+  df = pd.DataFrame(index=data.index)
+  df["Close"] = cl
+  df["Open"] = op
+  df["High"] = hi
+  df["Low"] = lo
+  df["Volume"] = vol
+
+  # TA-Lib 經典 K 線型態與技術指標
+  df["Pattern_Hammer"] = talib.CDLHAMMER(op, hi, lo, cl)
+  df["Pattern_Engulfing"] = talib.CDLENGULFING(op, hi, lo, cl)
+  df["RSI"] = talib.RSI(cl, timeperiod=14)
+  _, _, macdhist = talib.MACD(cl, fastperiod=12, slowperiod=26, signalperiod=9)
+  df["MACD_Hist"] = macdhist
+  df["SMA_50"] = talib.SMA(cl, timeperiod=50)
+
+  return df.dropna()
+
+
+try:
+  with st.spinner(f"正在從 Yahoo Finance 下載與運算 {ticker} 的數據..."):
+    df = load_and_process_data(ticker, start_date)
+
+  # 定義機器學習標籤與訓練
+  df["Target"] = (
+      df["Close"].shift(-forward_days) / df["Close"] - 1 > threshold
+  ).astype(int)
+  df_model = df.dropna()
+
+  feature_cols = [
+      "Pattern_Hammer",
+      "Pattern_Engulfing",
+      "RSI",
+      "MACD_Hist",
+      "SMA_50",
+  ]
+  X = df_model[feature_cols]
+  y = df_model["Target"]
+
+  # 訓練 XGBoost 模型
+  model = xgb.XGBClassifier(
+      n_estimators=100, learning_rate=0.03, max_depth=3, random_state=42
+  )
+  model.fit(X, y)
+  df["Signal"] = model.predict(df[feature_cols])
+
+  # --- 主畫面圖表呈現 ---
+  st.subheader(f"📊 {ticker.upper()} 即時 K 線走勢與 AI 預測訊號")
+
+  fig = go.Figure()
+
+  # 繪製 K 線
+  fig.add_trace(
+      go.Candlestick(
+          x=df.index,
+          open=df["Open"],
+          high=df["High"],
+          low=df["Low"],
+          close=df["Close"],
+          name="K線",
+      )
+  )
+
+  # 繪製 50 日均線
+  fig.add_trace(
+      go.Scatter(
+          x=df.index,
+          y=df["SMA_50"],
+          line=dict(color="orange", width=1.5),
+          name="50日均線 (SMA 50)",
+      )
+  )
+
+  # 標記 AI 買入訊號
+  buy_signals = df[df["Signal"] == 1]
+  fig.add_trace(
+      go.Scatter(
+          x=buy_signals.index,
+          y=buy_signals["Low"] * 0.98,
+          mode="markers",
+          marker=dict(symbol="triangle-up", size=12, color="#00FF7F"),
+          name="AI 建議買入訊號",
+      )
+  )
+
+  fig.update_layout(
+      xaxis_rangeslider_visible=False,
+      height=600,
+      template="plotly_dark",
+      margin=dict(l=20, r=20, t=30, b=20),
+  )
+  st.plotly_chart(fig, use_container_width=True)
+
+  # --- 數據指標卡片 ---
+  col1, col2, col3 = st.columns(3)
+  col1.metric("回測總交易天數", len(df))
+  col2.metric("AI 觸發買入次數", int(df["Signal"].sum()))
+  col3.metric(
+      "最新盤勢預測狀態",
+      "🔥 建議買入進場" if df["Signal"].iloc[-1] == 1 else "⏳ 建議觀望 / 空手",
+  )
+
+except Exception as e:
+  st.error(
+      f"載入資料發生錯誤，請確認股票代號是否正確（例如美股輸入 NVDA，港股輸入"
+      f" 0700.HK）。系統提示: {e}"
+  )
